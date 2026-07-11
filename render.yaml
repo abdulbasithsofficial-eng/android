@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: basixa-video-agent-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: BYPASS_LICENSE
+        value: "true"
+      - key: RENDER
+        value: "true"
+      - key: GEMINI_API_KEY
+        sync: false
+        placeholder: "Enter your Gemini API Key"
+      - key: PEXELS_API_KEY
+        sync: false
+        placeholder: "Enter your Pexels API Key"

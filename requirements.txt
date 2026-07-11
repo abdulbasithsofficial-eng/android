@@ -1,0 +1,5 @@
+flask
+requests
+imageio-ffmpeg
+edge-tts
+gunicorn
