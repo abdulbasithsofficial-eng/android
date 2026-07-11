@@ -1231,14 +1231,29 @@ def render_scene(ffmpeg, media, audio, out, vertical, duration, resolution="1080
                 font_size = int(h * 0.065)
                 box_border = int(h * 0.03)
                 
-            font_path = "Arial"
+            font_filter_part = ""
             if sys.platform == "win32":
                 win_font = Path("C:/Windows/Fonts/arialbd.ttf")
                 if win_font.exists():
                     font_path = str(win_font).replace("\\", "/").replace(":", "\\:")
+                    font_filter_part = f"fontfile='{font_path}':"
+            else:
+                linux_fonts = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+                ]
+                found = False
+                for lf in linux_fonts:
+                    if Path(lf).exists():
+                        font_filter_part = f"fontfile='{lf}':"
+                        found = True
+                        break
+                if not found:
+                    font_filter_part = ""
                     
             drawtext_filter = (
-                f"drawtext=fontfile='{font_path}':text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+                f"drawtext={font_filter_part}text='{safe_text}':fontcolor=white:fontsize={font_size}:"
                 f"box=1:boxcolor=black@0.65:boxborderw={box_border}:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2"
             )
@@ -2045,9 +2060,17 @@ def run_job(job_id, payload):
                 render_scene(ffmpeg, media, audio, clip, vertical, actual_duration, resolution=resolution, caption=caption, scene_index=i)
                 return clip
                 
+            completed_render = 0
+            scene_files = [None] * total
             with ThreadPoolExecutor(max_workers=4) as executor:
-                clips = list(executor.map(render_worker, range(1, total + 1)))
-            scene_files = clips
+                futures = {executor.submit(render_worker, i): i for i in range(1, total + 1)}
+                for future in as_completed(futures):
+                    i = futures[future]
+                    clip = future.result()
+                    scene_files[i - 1] = clip
+                    completed_render += 1
+                    prog = 45 + int((completed_render / total) * 40)
+                    update(job_id, "render", prog, f"Rendered scene {completed_render}/{total}")
             
             # Check if job was paused/stopped
             if jobs.get(job_id, {}).get("status") != "running":
