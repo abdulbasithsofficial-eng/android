@@ -1097,6 +1097,62 @@ def download_pollinations_image(prompt, dest, vertical, topic=""):
             time.sleep(1 + attempt * 2 + random.random())
 
 
+def write_google_tts(text, dest_wav, voice_name="en-US-AriaNeural"):
+    # Split text into chunks of 150 characters to stay within Google Translate's limit
+    words = text.split()
+    chunks = []
+    current = []
+    current_len = 0
+    for w in words:
+        if current_len + len(w) + 1 > 180:
+            chunks.append(" ".join(current))
+            current = [w]
+            current_len = len(w)
+        else:
+            current.append(w)
+            current_len += len(w) + 1
+    if current:
+        chunks.append(" ".join(current))
+        
+    import tempfile
+    import requests
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    lang_code = "en"
+    voice_lower = str(voice_name).lower()
+    if voice_lower.startswith("ur"):
+        lang_code = "ur"
+    elif voice_lower.startswith("hi"):
+        lang_code = "hi"
+        
+    combined_mp3_data = b""
+    for chunk in chunks:
+        url = f"https://translate.google.com/translate_tts?ie=UTF-8&tl={lang_code}&client=tw-ob&q={requests.utils.quote(chunk)}"
+        res = requests.get(url, headers=headers, timeout=20)
+        res.raise_for_status()
+        combined_mp3_data += res.content
+        
+    # Write to a temp MP3 file
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        f.write(combined_mp3_data)
+        temp_mp3 = Path(f.name)
+        
+    try:
+        ffmpeg = ffmpeg_bin()
+        subprocess.run([
+            ffmpeg, "-y", "-i", str(temp_mp3), "-ar", "44100", "-ac", "2", str(dest_wav)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15, creationflags=SUBPROCESS_FLAGS)
+    finally:
+        if temp_mp3.exists():
+            try:
+                temp_mp3.unlink()
+            except Exception:
+                pass
+
+
 def write_tts_wav(text, dest, voice="en-US-AriaNeural", rate="+3%"):
     voice = voice or os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
     tmp_mp3 = dest.with_suffix(".mp3")
@@ -1126,13 +1182,17 @@ def write_tts_wav(text, dest, voice="en-US-AriaNeural", rate="+3%"):
             except Exception:
                 pass
     except Exception as exc:
-        print("Edge TTS subprocess failed, falling back to PowerShell:", exc)
-        # Fallback to PowerShell SpeechSynthesizer
-        text_file = dest.with_suffix(".txt")
+        print("Edge TTS subprocess failed, falling back to Google Translate TTS:", exc)
         try:
-            text_file.write_text(text, encoding="utf-8")
-            tmp_wav = dest.with_suffix(".tmp.wav")
-            ps = f"""
+            write_google_tts(text, dest, voice)
+        except Exception as e2:
+            print("Google TTS fallback failed, trying Windows SpeechSynthesizer or silent audio fallback:", e2)
+            if sys.platform == "win32":
+                text_file = dest.with_suffix(".txt")
+                try:
+                    text_file.write_text(text, encoding="utf-8")
+                    tmp_wav = dest.with_suffix(".tmp.wav")
+                    ps = f"""
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
 $synth.Rate = 1
@@ -1142,17 +1202,20 @@ $synth.SetOutputToWaveFile('{str(tmp_wav).replace("'", "''")}')
 $synth.Speak($text)
 $synth.Dispose()
 """
-            subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=20, creationflags=SUBPROCESS_FLAGS)
-            if tmp_wav.exists():
-                tmp_wav.replace(dest)
-        except Exception as ps_exc:
-            print("PowerShell TTS also failed:", ps_exc)
-        finally:
-            if text_file.exists():
-                try:
-                    text_file.unlink()
-                except Exception:
-                    pass
+                    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=20, creationflags=SUBPROCESS_FLAGS)
+                    if tmp_wav.exists():
+                        tmp_wav.replace(dest)
+                        return
+                except Exception as ps_exc:
+                    print("PowerShell TTS also failed:", ps_exc)
+                finally:
+                    if text_file.exists():
+                        try:
+                            text_file.unlink()
+                        except Exception:
+                            pass
+            # Final safety fallback: write silent wav of 4 seconds to prevent pipeline crashes
+            write_silent_wav(4.0, dest)
 
 
 def wav_duration(path):
@@ -1931,8 +1994,20 @@ def run_job(job_id, payload):
                     render_scene(ffmpeg, media, audio, clip, vertical, actual_duration, resolution=resolution, caption=caption, scene_index=i)
                     return clip
                 
+                completed_ch_render = 0
+                ch_total = len(ch_script["scenes"])
+                clips = [None] * ch_total
                 with ThreadPoolExecutor(max_workers=4) as executor:
-                    clips = list(executor.map(ch_render_worker, range(1, len(ch_script["scenes"]) + 1)))
+                    futures = {executor.submit(ch_render_worker, i): i for i in range(1, ch_total + 1)}
+                    for future in as_completed(futures):
+                        i = futures[future]
+                        clip = future.result()
+                        clips[i - 1] = clip
+                        completed_ch_render += 1
+                        total_scenes_approx = num_chapters * ch_total
+                        current_scene_global = (ch_idx - 1) * ch_total + completed_ch_render
+                        prog = 45 + int((current_scene_global / total_scenes_approx) * 40)
+                        update(job_id, "render", prog, f"Rendered scene {completed_ch_render}/{ch_total} in chapter {ch_idx}")
                 chapter_files.extend(clips)
             
             # Check if job was paused/stopped
@@ -2112,6 +2187,20 @@ def home():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True})
+
+
+@app.get("/api/code-check")
+def code_check():
+    try:
+        content = Path(__file__).read_text(encoding="utf-8")
+        has_map = "executor.map(render_worker" in content
+        return jsonify({
+            "has_old_executor_map": has_map,
+            "file_size": len(content),
+            "platform": sys.platform
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 @app.get("/api/latest")
