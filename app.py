@@ -1320,19 +1320,51 @@ def render_scene(ffmpeg, media, audio, out, vertical, duration, resolution="1080
                 f"box=1:boxcolor=black@0.65:boxborderw={box_border}:"
                 f"x=(w-text_w)/2:y=(h-text_h)/2"
             )
-            polish = f"{polish},{drawtext_filter}"
-            
-    vf = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{polish}"
-    
+            polish_with_caption = f"{polish},{drawtext_filter}"
+        else:
+            polish_with_caption = polish
+    else:
+        polish_with_caption = polish
+
+    # --- FIX: run ffmpeg with real stderr captured, and retry WITHOUT the
+    # caption/drawtext filter if the first attempt fails. This makes the
+    # pipeline resilient to servers (like Render) where the drawtext filter
+    # or font file isn't available/working, instead of crashing the whole job. ---
+    def _run_ffmpeg(cmd, allow_retry_without_caption, base_vf):
+        try:
+            subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                check=True, creationflags=SUBPROCESS_FLAGS
+            )
+        except subprocess.CalledProcessError as e:
+            stderr_text = (e.stderr or b"").decode(errors="ignore")[-1500:]
+            print(f"[ffmpeg] scene {scene_index} failed (exit {e.returncode}): {stderr_text}")
+            if allow_retry_without_caption:
+                print(f"[ffmpeg] Retrying scene {scene_index} WITHOUT caption/drawtext...")
+                fallback_cmd = list(cmd)
+                vf_index = fallback_cmd.index("-vf")
+                fallback_cmd[vf_index + 1] = base_vf
+                subprocess.run(
+                    fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    check=True, creationflags=SUBPROCESS_FLAGS
+                )
+            else:
+                raise
+
+    caption_used = polish_with_caption != polish
+    vf = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{polish_with_caption}"
+    vf_no_caption = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{polish}"
+
     if media.suffix.lower() == ".mp4":
-        subprocess.run([
+        cmd = [
             ffmpeg, "-y", "-stream_loop", "-1", "-i", str(media), "-i", str(audio),
             "-t", f"{duration:.2f}", 
             "-map", "0:v:0", "-map", "1:a:0",
             "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", 
             "-c:a", "aac", "-filter:a", "volume=3.0", "-ar", "44100", "-ac", "2", "-b:a", "192k",
             "-b:v", "4000k" if vertical else "6000k", "-pix_fmt", "yuv420p", "-r", "30", str(out)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, creationflags=SUBPROCESS_FLAGS)
+        ]
+        _run_ffmpeg(cmd, caption_used, vf_no_caption)
     else:
         frames = int(duration * 30)
         zoom_size = f"{w}x{h}"
@@ -1348,15 +1380,17 @@ def render_scene(ffmpeg, media, audio, out, vertical, duration, resolution="1080
             zoom = f"zoompan=z=1.06:x='iw-(iw/zoom)-0.001*on*iw':y='ih/2-(ih/zoom/2)'"
             
         zoom_filter = f"{zoom}:d={frames}:s={zoom_size}:fps=30"
-        image_vf = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{zoom_filter},{polish}"
-        subprocess.run([
+        image_vf = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{zoom_filter},{polish_with_caption}"
+        image_vf_no_caption = f"scale={size}:force_original_aspect_ratio=increase,crop={size},setsar=1,{zoom_filter},{polish}"
+        cmd = [
             ffmpeg, "-y", "-loop", "1", "-i", str(media), "-i", str(audio),
             "-t", f"{duration:.2f}", 
             "-map", "0:v:0", "-map", "1:a:0",
             "-vf", image_vf, "-c:v", "libx264", "-preset", "ultrafast", 
             "-tune", "stillimage", "-c:a", "aac", "-filter:a", "volume=3.0", "-ar", "44100", "-ac", "2", "-b:a", "192k",
             "-b:v", "4000k" if vertical else "6000k", "-pix_fmt", "yuv420p", "-r", "30", str(out)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, creationflags=SUBPROCESS_FLAGS)
+        ]
+        _run_ffmpeg(cmd, caption_used, image_vf_no_caption)
 
 
 def concat_wavs_with_padding(audio_items, output_path):
