@@ -1718,7 +1718,27 @@ def process_scene_assets(i, scene, job_dir, pexels_key, vertical, voice, used_me
                     write_tts_wav(scene["narration"], audio, voice, rate)
     except Exception as exc:
         print(f"Error generating voice for scene {i}: {exc}")
-        
+
+    # --- GUARANTEED FALLBACK (crash fix) ---
+    # No matter what happened above (edge-tts blocked on cloud IP, Google TTS
+    # blocked/rate-limited, or any other silent exception), make 100% sure a
+    # valid audio file exists before this function returns. Without this,
+    # wav_duration() downstream crashes with FileNotFoundError when a scene's
+    # TTS silently failed on cloud hosts like Render (this was the root cause
+    # of the 45% crash on the deployed backend).
+    if not audio.exists() or audio.stat().st_size == 0:
+        try:
+            fallback_dur = float(scene.get("duration", 4)) if use_custom_vo else 4.0
+            write_silent_wav(fallback_dur, audio)
+            print(f"[FIX] Forced silent-audio fallback for scene {i} — all TTS methods failed on this server.")
+        except Exception as final_exc:
+            print(f"[FIX] CRITICAL: even silent-wav fallback failed for scene {i}: {final_exc}")
+            # last resort: write minimal silence directly, should never fail
+            import wave as _wave
+            with _wave.open(str(audio), "wb") as _w:
+                _w.setnchannels(2); _w.setsampwidth(2); _w.setframerate(44100)
+                _w.writeframes(b"\x00" * (44100 * 4 * 4))
+
     # Write cache validation files to lock in the successfully verified state
     try:
         txt_path.write_text(str(scene.get("narration", "")).strip(), encoding="utf-8")
